@@ -1,0 +1,48 @@
+{
+  "name": "AutoCST 周期反射单元闭环验收",
+  "hypothesis": "在固定周期、介质与入射条件下，改变方形金属贴片边长可改变反射相位，同时维持较高的同极化反射幅度。",
+  "objective": {
+    "kind": "phase_target",
+    "observable": "s11",
+    "frequency_ghz": 10.0,
+    "target_phase_deg": -90.0,
+    "tolerance_deg": 5.0,
+    "reference_plane": "patch_top",
+    "polarization": "Zmax Floquet TE(0,0), normal incidence"
+  },
+  "constraints": {
+    "min_reflection_magnitude": 0.9,
+    "max_cross_power": 0.01,
+    "max_power_balance_error": 0.05
+  },
+  "model": {
+    "kind": "metasurface",
+    "fixed_parameters": {
+      "period_mm": 15.0,
+      "substrate_height_mm": 1.6,
+      "epsilon_r": 2.2,
+      "metal_thickness_mm": 0.035,
+      "air_height_mm": 10.0,
+      "fmin_ghz": 9.5,
+      "fmax_ghz": 10.5,
+      "frequency_samples": 21
+    }
+  },
+  "parameter_bounds": {"patch_mm": {"min": 4.0, "max": 14.0}},
+  "budgets": {
+    "max_runs": 14,
+    "max_total_solver_seconds": 8400,
+    "max_run_solver_seconds": 600
+  },
+  "validation": {
+    "mesh_steps_per_wavelength": [10, 15, 20],
+    "max_phase_change_deg": 3.0,
+    "max_magnitude_change": 0.01,
+    "reference_plane_air_height_check": "required before interpreting absolute phase"
+  },
+  "authorization": {
+    "policy": "Autonomous parameter changes within the recorded bounds; discuss changes to topology, hypothesis, objectives or budgets",
+    "role": "Tool acceptance benchmark; not a user-specific final scientific design"
+  },
+  "evidence_boundary": "Idealized PEC and lossless dielectric numerical simulation; no physical measurements"
+}

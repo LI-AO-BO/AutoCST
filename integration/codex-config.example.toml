@@ -1,0 +1,12 @@
+# Add this server to a trusted project or local Codex MCP configuration.
+# This example does not change user settings by itself.
+# Replace C:\path\to\AutoCST with your checkout's absolute path.
+[mcp_servers.autocst]
+command = 'C:\path\to\AutoCST\.venv\Scripts\python.exe'
+args = ['-m', 'autocst.mcp_server', '--root', 'C:\path\to\AutoCST']
+cwd = 'C:\path\to\AutoCST'
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+
+[mcp_servers.autocst.env]
+PYTHONIOENCODING = 'utf-8'

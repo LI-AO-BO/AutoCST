@@ -1,0 +1,12 @@
+{
+  "kind": "waveguide",
+  "parameters": {
+    "a_mm": 22.86,
+    "b_mm": 10.16,
+    "length_mm": 40.0,
+    "fmin_ghz": 8.2,
+    "fmax_ghz": 12.4
+  },
+  "timeout_seconds": 300,
+  "solve": true
+}

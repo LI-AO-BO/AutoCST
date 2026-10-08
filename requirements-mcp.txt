@@ -1,0 +1,2 @@
+# Optional ChatGPT/Codex bridge; the command-line runner does not require MCP.
+mcp>=1.12,<2

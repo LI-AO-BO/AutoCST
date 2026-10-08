@@ -1,0 +1,2 @@
+# Optional PNG report rendering; install after requirements.txt.
+matplotlib>=3.8,<4
