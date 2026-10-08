@@ -186,6 +186,7 @@ class OptimizationBatches:
         for run in context["runs"]:
             parameters = run["job"].get("parameters", {})
             if (run["state"] == "completed" and run["spec_version"] == request["spec_version"] and
+                    run["job"].get("lumped_elements", []) == candidate["job"].get("lumped_elements", []) and
                     {key: value for key, value in parameters.items() if key not in mesh_keys} == physical and
                     run["details"].get("analysis", {}).get("usable_for_optimization") is True):
                 mesh = parameters.get("mesh_cells_per_box")

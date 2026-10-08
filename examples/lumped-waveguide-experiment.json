@@ -1,0 +1,21 @@
+{
+  "objective": {
+    "kind": "phase_target", "observable": "s21", "frequency_ghz": 10,
+    "target_phase_deg": -90, "tolerance_deg": 5
+  },
+  "model": {
+    "kind": "waveguide",
+    "fixed_parameters": {"a_mm": 22.86, "b_mm": 10.16, "length_mm": 40},
+    "lumped_elements": [
+      {
+        "name": "RLC_load", "type": "rlcparallel", "resistance_ohm": 50,
+        "inductance_nh": 0, "capacitance_pf": "C_load_pf",
+        "point1_mm": ["a_mm/2", 0, "length_mm/2"],
+        "point2_mm": ["a_mm/2", "b_mm", "length_mm/2"], "monitor": true
+      }
+    ]
+  },
+  "parameter_bounds": {"C_load_pf": [0.1, 0.6]},
+  "constraints": {"max_estimated_absorbed_power": 1},
+  "budgets": {"max_runs": 3, "max_total_solver_seconds": 900, "max_run_solver_seconds": 300}
+}

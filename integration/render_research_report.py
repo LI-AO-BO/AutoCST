@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from autocst.research_store import ResearchStore
+from autocst.lumped import lumped_metadata
 
 
 def _number(value, digits=5) -> str:
@@ -54,7 +55,8 @@ def _mesh_group(samples: list[dict]) -> list[dict]:
     for sample in samples:
         if not isinstance(sample["mesh"], (int, float)) or isinstance(sample["mesh"], bool):
             continue
-        key = (sample["version"], json.dumps(sample["physical_parameters"], sort_keys=True))
+        key = (sample["version"], json.dumps(sample["physical_parameters"], sort_keys=True),
+               json.dumps(sample.get("lumped_elements", []), sort_keys=True))
         groups.setdefault(key, []).append(sample)
     eligible = [group for group in groups.values() if len({item["mesh"] for item in group}) >= 2]
     return max(eligible, key=lambda group: max(item["number"] for item in group), default=[])
@@ -87,6 +89,7 @@ def _plot(context: dict, output: Path) -> dict:
                             "power": metrics.get("total_reflected_power"),
                             "version": run["spec_version"], "number": index,
                             "mesh": _initial_cells(run),
+                            "lumped_elements": run["job"].get("lumped_elements", []),
                             "physical_parameters": {key: value for key, value in params.items()
                                                     if key not in {"mesh_steps_per_wavelength", "mesh_cells_per_box"}},
                             "usable": analysis.get("usable_for_optimization", False)})
@@ -214,6 +217,8 @@ def render_report(context: dict, output_dir: Path) -> dict:
         old_params = parent["job"].get("parameters", {}) if parent else {}
         changes = "; ".join(f"{key}: {_number(old_params.get(key))} → {_number(value)}"
                             for key, value in params.items() if key not in old_params or old_params[key] != value)
+        if parent and parent["job"].get("lumped_elements", []) != run["job"].get("lumped_elements", []):
+            changes += ("; " if changes else "") + "集中元件定义变化（详见连接记录）"
         if not parent:
             changes = "基线：" + "; ".join(f"{key}={_number(params.get(key))}" for key in
                                           list(spec.get("parameter_bounds", {})) + ["mesh_steps_per_wavelength"]
@@ -229,6 +234,20 @@ def render_report(context: dict, output_dir: Path) -> dict:
         lines.append("| " + " | ".join(_cell(value) for value in row) + " |")
     if not runs:
         lines.append("| — | 尚未提交运行 | — | — | — | 等待实验 |")
+    loaded = [run for run in runs if run["job"].get("lumped_elements")]
+    if loaded:
+        lines += ["", "## 集中元件与连接记录", "",
+                  "各轮解析元件参数后重建，单位明确；吸收数值是 S 参数未返回功率的估计，不是独立耗散功率验收。", "",
+                  "| 运行 | 元件 | 类型 | R / Ω | L / nH | C / pF | 起点 / mm | 终点 / mm | 估计未返回功率 |",
+                  "| --- | --- | --- | ---: | ---: | ---: | --- | --- | ---: |"]
+        for run in loaded:
+            loading = lumped_metadata(run["job"]["lumped_elements"], run["job"]["parameters"])
+            for element in loading["elements"]:
+                row = [run["run_id"][:12], element["name"], element["type"],
+                       _number(element["resistance_ohm"]), _number(element["inductance_nh"]),
+                       _number(element["capacitance_pf"]), str(element["point1_mm"]), str(element["point2_mm"]),
+                       _number(_analysis(run).get("metrics", {}).get("estimated_absorbed_power"))]
+                lines.append("| " + " | ".join(_cell(value) for value in row) + " |")
     lines += ["",
              "## 目标与实验合同", "",
              "```json", json.dumps({"objective": objective, "constraints": spec.get("constraints", {}),

@@ -93,15 +93,25 @@ def analyze_sparameters(csv_path: Path, spec: dict, solver_success: bool = True,
     power = sample.get("total_reflected_power")
     if power is not None:
         metrics["total_reflected_power"] = power
-        metrics["power_balance_error"] = abs(1.0 - power)
+        if "estimated_absorbed_power" not in sample:
+            metrics["power_balance_error"] = abs(1.0 - power)
     elif s21 is not None:
         power = abs(s11) ** 2 + abs(s21) ** 2
         metrics["two_port_power"] = power
-        metrics["power_balance_error"] = abs(1.0 - power)
+        if "estimated_absorbed_power" not in sample:
+            metrics["power_balance_error"] = abs(1.0 - power)
     physical_checks = {}
     if power is not None:
         physical_checks["nonnegative_power"] = power >= 0
         physical_checks["passivity_with_5_percent_margin"] = power <= 1.05
+    if "estimated_absorbed_power" in sample:
+        metrics["estimated_absorbed_power"] = sample["estimated_absorbed_power"]
+        metrics["absorption_scope"] = "Estimated unreturned power from selected S-parameters; independent dissipated-power balance not verified"
+        if power is None:
+            raise ValueError("Estimated absorbed power requires exported outgoing power")
+        if interpolation == "exact_sample":
+            physical_checks["absorption_estimate_matches_export"] = math.isclose(sample["estimated_absorbed_power"], 1.0 - power,
+                                                                                rel_tol=1e-5, abs_tol=1e-8)
     if "total_reflected_power" in sample and "cross_power" in metrics and interpolation == "exact_sample":
         modal_sum = abs(s11) ** 2 + metrics["cross_power"]
         physical_checks["modal_power_matches_export"] = math.isclose(power, modal_sum, rel_tol=1e-5, abs_tol=1e-8)
@@ -110,6 +120,8 @@ def analyze_sparameters(csv_path: Path, spec: dict, solver_success: bool = True,
                "min_s11_db": ("s11_db", "min"), "max_s11_db": ("s11_db", "max"),
                "min_s21_db": ("s21_db", "min"), "max_s21_db": ("s21_db", "max"),
                "max_cross_power": ("cross_power", "max"),
+               "min_estimated_absorbed_power": ("estimated_absorbed_power", "min"),
+               "max_estimated_absorbed_power": ("estimated_absorbed_power", "max"),
                "max_power_balance_error": ("power_balance_error", "max")}
     checks = {}
     for name, threshold in constraints.items():

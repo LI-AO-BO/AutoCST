@@ -28,7 +28,9 @@ class ResearchService:
         self.store = ResearchStore(self.state)
 
     def environment(self) -> dict:
-        return {**environment(), "version": "0.2.0", "workspace": str(self.root),
+        from . import __version__
+        return {**environment(), "version": __version__, "workspace": str(self.root),
+                "supported_lumped_elements": ["rlcserial", "rlcparallel"],
                 "supported_research_jobs": ["metasurface", "waveguide", "history", "existing_project"],
                 "runner": self.runner_status(), "solver_policy": "explicit_user_selected_cst_pid",
                 "long_run_boundary": "Submitted solver/export/metrics continue independently; Codex reasoning resumes when app is available"}
@@ -73,6 +75,10 @@ class ResearchService:
             low, high = (bounds["min"], bounds["max"]) if isinstance(bounds, dict) else bounds
             if name not in parameters or not low <= parameters[name] <= high:
                 raise ValueError(f"Parameter {name} must lie in the agreed experiment bounds")
+        from .lumped import normalize_lumped_elements
+        declared = normalize_lumped_elements(model.get("lumped_elements", []), parameters)
+        if declared != job.get("lumped_elements", []):
+            raise ValueError("Lumped topology differs from the experiment; declare model.lumped_elements or revise the experiment")
         if job["timeout_seconds"] > spec["budgets"]["max_run_solver_seconds"]:
             raise ValueError("Job solver limit exceeds the agreed single-run budget")
 
@@ -96,6 +102,8 @@ class ResearchService:
             path = Path(normalized.pop("history_path")).expanduser().resolve()
             normalized["history_text"] = path.read_text(encoding="utf-8-sig")
             normalized["history_source"] = {"path": str(path), "sha256": sha256(path)}
+            if normalized.get("lumped_elements"):
+                normalized["base_history_text"] = normalized["history_text"]
         source = normalized.get("source_project")
         if source:
             path = Path(source).expanduser().resolve()
@@ -106,9 +114,13 @@ class ResearchService:
         prepared_id = uuid.uuid4().hex
         directory = self.state / "prepared" / prepared_id
         directory.mkdir(parents=True)
+        if normalized.get("lumped_elements"):
+            normalized.setdefault("base_history_text", normalized["history_text"])
         history = render_history(normalized)
         (directory / "history.vba").write_bytes((history or "").encode("utf-8"))
         normalized["history_text"] = history or normalized.get("history_text", "")
+        if normalized.get("lumped_elements"):
+            normalized["execution_history_frozen"] = True
         code_hashes = {p.name: sha256(p) for p in (self.root / "autocst").glob("*.py")}
         payload = {"prepared_id": prepared_id, "experiment_id": experiment_id,
                    "experiment_version": experiment.get("version", experiment.get("spec_version", 1)),
@@ -119,6 +131,9 @@ class ResearchService:
                        "cst_identity": identity, "solver_budget_seconds": normalized.get("timeout_seconds"),
                        "history_file": str(directory / "history.vba"),
                        "scientific_scope": "Idealized numerical simulation; mesh convergence and measurement are separate"}}
+        if normalized.get("lumped_elements"):
+            from .lumped import lumped_metadata
+            payload["review"]["lumped_elements"] = lumped_metadata(normalized["lumped_elements"], normalized["parameters"])
         write_json(directory / "prepared.json", payload)
         (directory / "prepared.sha256").write_text(sha256(directory / "prepared.json"), encoding="ascii")
         return payload

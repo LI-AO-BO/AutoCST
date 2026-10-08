@@ -1,0 +1,18 @@
+{
+  "kind": "waveguide",
+  "cst_pid": 12345,
+  "timeout_seconds": 300,
+  "parameters": {"C_load_pf": 0.2},
+  "lumped_elements": [
+    {
+      "name": "RLC_load",
+      "type": "rlcparallel",
+      "resistance_ohm": 50,
+      "inductance_nh": 0,
+      "capacitance_pf": "C_load_pf",
+      "point1_mm": ["a_mm/2", 0, "length_mm/2"],
+      "point2_mm": ["a_mm/2", "b_mm", "length_mm/2"],
+      "monitor": true
+    }
+  ]
+}

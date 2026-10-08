@@ -274,8 +274,12 @@ def create_server(
         """Validate and freeze reviewable simulation inputs without executing CST.
 
         Supply the proposed job and a decision record explaining the evidence
-        and reason for this step. The service enforces experiment limits. Inspect
-        the returned prepared inputs before calling cst_submit_prepared; merely
+        and reason for this step. The service enforces experiment limits.
+        job.lumped_elements supports passive linear rlcserial/rlcparallel loads:
+        resistance_ohm, inductance_nh, capacitance_pf, point1_mm and point2_mm.
+        Declare the same topology in spec.model.lumped_elements; numeric parameters
+        or bounded arithmetic expressions resolve and freeze separately for each run.
+        Inspect the returned prepared inputs before calling cst_submit_prepared; merely
         preparing a job does not run it or establish numerical/physical success.
         """
         return research().prepare_job(experiment_id, job, decision if decision is not None else {})

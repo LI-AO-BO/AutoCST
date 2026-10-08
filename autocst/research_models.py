@@ -5,7 +5,8 @@ import math
 from pathlib import Path
 import re
 
-from .models import C0, waveguide_history, waveguide_parameters
+from .models import C0, WAVEGUIDE_DEFAULTS, waveguide_history, waveguide_parameters
+from .lumped import lumped_metadata, normalize_lumped_elements, referenced_parameters, render_lumped_history
 
 METASURFACE_DEFAULTS = {
     "period_mm": 15.0, "patch_mm": 10.0, "substrate_height_mm": 1.6,
@@ -20,7 +21,7 @@ def _numbers(parameters: dict) -> dict:
         raise ValueError("parameters must be an object")
     result = {}
     for key, value in parameters.items():
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
             raise ValueError(f"Invalid CST parameter name: {key!r}")
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{key} must be numeric, not executable text")
@@ -79,12 +80,41 @@ def normalize_research_job(job: dict) -> dict:
     if kind not in {"metasurface", "waveguide", "history", "existing_project"}:
         raise ValueError("Unsupported research kind")
     parameters = job.get("parameters", {})
+    elements = job.get("lumped_elements", [])
+    references = referenced_parameters(elements)
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+    geometry_names = (set(METASURFACE_DEFAULTS) | {"mesh_cells_per_box"} if kind == "metasurface"
+                      else set(WAVEGUIDE_DEFAULTS) if kind == "waveguide" else set(parameters))
+    extra = _numbers({key: value for key, value in parameters.items() if key not in geometry_names})
+    if set(extra) - references:
+        raise ValueError(f"Unsupported parameters not referenced by lumped elements: {sorted(set(extra) - references)}")
+    base = {key: value for key, value in parameters.items() if key in geometry_names}
     if kind == "metasurface":
-        parameters = metasurface_parameters(parameters)
+        parameters = {**metasurface_parameters(base), **extra}
     elif kind == "waveguide":
-        parameters = waveguide_parameters(parameters)
+        parameters = {**waveguide_parameters(base), **extra}
     else:
         parameters = _numbers(parameters)
+    if "lumped_elements" in job:
+        normalized["lumped_elements"] = normalize_lumped_elements(elements, parameters)
+        loading = lumped_metadata(normalized["lumped_elements"], parameters)
+        if kind == "metasurface":
+            half = parameters["period_mm"] / 2
+            # Air spacing is added above CST's automatic structure bbox.
+            # Loads must not move that bbox and invalidate phase deembedding.
+            bounds = [(-half, half), (-half, half),
+                      (-parameters["metal_thickness_mm"], parameters["substrate_height_mm"] +
+                       parameters["metal_thickness_mm"])]
+        elif kind == "waveguide":
+            bounds = [(0, parameters[key]) for key in ("a_mm", "b_mm", "length_mm")]
+        else:
+            bounds = None
+        if bounds:
+            for element in loading["elements"]:
+                for point in (element["point1_mm"], element["point2_mm"]):
+                    if any(not low <= value <= high for value, (low, high) in zip(point, bounds)):
+                        raise ValueError("Lumped endpoints must stay inside the template's physical domain")
     pid = job.get("cst_pid")
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0):
         raise ValueError("cst_pid must be an explicit positive integer")
@@ -97,6 +127,11 @@ def normalize_research_job(job: dict) -> dict:
     history = job.get("history_text", "")
     if not isinstance(history, str) or len(history.encode("utf-8")) > 2_000_000 or "\0" in history:
         raise ValueError("history_text must be at most 2 MB of text without NUL characters")
+    base_history = job.get("base_history_text", history)
+    if not isinstance(base_history, str) or len(base_history.encode("utf-8")) > 2_000_000 or "\0" in base_history:
+        raise ValueError("base_history_text must be at most 2 MB of text without NUL characters")
+    if "execution_history_frozen" in job and not isinstance(job["execution_history_frozen"], bool):
+        raise ValueError("execution_history_frozen must be boolean")
     if kind == "history" and not history.strip():
         raise ValueError("history jobs require explicit frozen history_text")
     source = job.get("source_project")
@@ -269,12 +304,18 @@ End With
 
 def render_history(job: dict) -> str:
     normalized = normalize_research_job(job)
+    parameters = normalized["parameters"]
     if normalized["kind"] == "metasurface":
-        return metasurface_history(normalized["parameters"])
-    if normalized["kind"] == "waveguide":
-        return waveguide_history(normalized["parameters"])
-    parameter_text = _parameter_history(normalized["parameters"])
-    return parameter_text + "\n" + normalized["history_text"] + "\n"
+        geometry = {key: value for key, value in parameters.items() if key in METASURFACE_DEFAULTS or key == "mesh_cells_per_box"}
+        extra = {key: value for key, value in parameters.items() if key not in geometry}
+        script = _parameter_history(extra) + "\n" + metasurface_history(geometry) if extra else metasurface_history(geometry)
+    elif normalized["kind"] == "waveguide":
+        geometry = {key: value for key, value in parameters.items() if key in WAVEGUIDE_DEFAULTS}
+        extra = {key: value for key, value in parameters.items() if key not in geometry}
+        script = _parameter_history(extra) + "\n" + waveguide_history(geometry) if extra else waveguide_history(geometry)
+    else:
+        script = _parameter_history(parameters) + "\n" + normalized.get("base_history_text", normalized["history_text"]) + "\n"
+    return script + render_lumped_history(normalized.get("lumped_elements", []), parameters)
 
 
 def metasurface_metadata(parameters: dict) -> dict:

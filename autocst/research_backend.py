@@ -19,8 +19,9 @@ import uuid
 from .config import find_cst
 from .cst_backend import CSTCleanupRequired, CSTLaunchPermissionError, launch_permission_diagnostic
 from .models import validate_waveguide
+from .lumped import lumped_metadata
 from .process_identity import get_process_identity, matches_process
-from .research_models import metasurface_metadata, normalize_research_job, render_history
+from .research_models import METASURFACE_DEFAULTS, metasurface_metadata, normalize_research_job, render_history
 
 
 def _utc() -> str:
@@ -96,7 +97,10 @@ class ResearchSession:
     def prepare(self) -> dict:
         if (self.run_dir / "binding.json").exists() or self.project_path.exists():
             raise FileExistsError("This research run already has a binding or project; recover instead of preparing again")
-        script = self.job.get("history_text") or render_history(self.job)
+        if self.job.get("lumped_elements") and not self.job.get("execution_history_frozen"):
+            script = render_history(self.job)
+        else:
+            script = self.job.get("history_text") or render_history(self.job)
         (self.run_dir / "history.vba").write_text(script, encoding="utf-8")
         _write(self.run_dir / "research_job.json", self.job)
         root, interface, _ = _load_cst()
@@ -166,8 +170,8 @@ class ResearchSession:
                     for key, value in self.job["parameters"].items():
                         self.project.model3d.StoreParameter(key, value)
                     self.project.model3d.Rebuild()
-                if self.job["history_text"].strip():
-                    self.project.model3d.add_to_history("AutoCST explicit research modification", self.job["history_text"], timeout=None)
+                if script.strip():
+                    self.project.model3d.add_to_history("AutoCST explicit research modification", script, timeout=None)
             else:
                 self.project = self.de.new_mws()
                 self.project.save(str(self.project_path), include_results=False, allow_overwrite=False)
@@ -180,8 +184,18 @@ class ResearchSession:
             self._record("results_reset.json", {"fresh_project": self.job["kind"] != "existing_project",
                          "copied_results_deleted": self.job["kind"] == "existing_project",
                          "project_sha256_before_run": _hash(self.project_path)})
-            model = (metasurface_metadata(self.job["parameters"]) if self.job["kind"] == "metasurface"
+            geometry_parameters = {key: value for key, value in self.job["parameters"].items()
+                                   if key in METASURFACE_DEFAULTS or key == "mesh_cells_per_box"}
+            model = (metasurface_metadata(geometry_parameters) if self.job["kind"] == "metasurface"
                      else {"kind": self.job["kind"], "parameters": self.job["parameters"]})
+            model["parameters"] = self.job["parameters"]
+            if self.job.get("lumped_elements"):
+                loading = lumped_metadata(self.job["lumped_elements"], self.job["parameters"])
+                loading["cst_history_assertions"] = {
+                    "passed": True, "history_sha256": self.binding["history_sha256"],
+                    "scope": "CST returned from the generated element property and coordinate assertions"}
+                model["lumped_elements"] = loading
+                _write(self.run_dir / "lumped_elements.json", loading)
             _write(self.run_dir / "model.json", model)
             complete = {"binding_id": self.binding["binding_id"], "solver": solver,
                         "project_path": str(self.project_path), "project_sha256": _hash(self.project_path)}
@@ -384,6 +398,8 @@ class ResearchSession:
                   "numerical_validity": {"passed": None, "scope": "No problem-specific validator"},
                   "target_achieved": None, "physical_measurements": False,
                   "project_sha256": saved["project_sha256"]}
+        if self.job.get("lumped_elements"):
+            result["lumped_elements"] = lumped_metadata(self.job["lumped_elements"], self.job["parameters"])
         if not self.job["solve"]:
             result["status"] = "model_only"
             _write(self.run_dir / "research_result.json", result)
@@ -402,17 +418,27 @@ class ResearchSession:
         if self.job["kind"] == "metasurface" and not evidence.get("only_zmax_mode_1"):
             raise RuntimeError("Cannot verify the requested Zmax mode 1 excitation from the saved solver log")
         curves = self._export_curves()
+        monitor_receipt = self.run_dir / "lumped_monitor_exports.json"
+        if self.job.get("lumped_elements") and monitor_receipt.is_file():
+            result["lumped_monitor_exports"] = json.loads(monitor_receipt.read_text(encoding="utf-8"))
         result["data_integrity"] = {"passed": bool(curves), "curve_count": len(curves),
                                     "checks": ["saved_project_sha256", "exact_tree_path_and_run_id", "finite_aligned_arrays"]}
         if self.job["kind"] == "metasurface":
             result["numerical_validity"] = self._metasurface_result(curves)
             numerical = result["numerical_validity"]
             numerical["power_balance_passed"] = numerical["passed"]
+            if numerical.get("dissipative_loading"):
+                numerical["passivity_check_passed"] = numerical["passed"]
+                # S-parameter power deficit is not an independent measurement
+                # of resistor loss, so it cannot certify energy balance.
+                numerical["power_balance_passed"] = None
             numerical["adaptive_solver_criterion_met"] = evidence.get("adaptive_accuracy_limit_reached")
-            numerical["passed"] = numerical["power_balance_passed"] and numerical["adaptive_solver_criterion_met"] is True
+            power_passed = numerical.get("passivity_check_passed", numerical["power_balance_passed"])
+            numerical["passed"] = power_passed and numerical["adaptive_solver_criterion_met"] is True
             numerical["status"] = ("checks_passed" if numerical["passed"] else
                                    "adaptation_evidence_unknown" if numerical["adaptive_solver_criterion_met"] is None else
-                                   "adaptation_not_converged" if not numerical["adaptive_solver_criterion_met"] else "power_balance_failed")
+                                   "adaptation_not_converged" if not numerical["adaptive_solver_criterion_met"] else
+                                   "passivity_failed" if numerical.get("dissipative_loading") else "power_balance_failed")
             _write(self.run_dir / "numerical_check.json", numerical)
             result["data_integrity"]["checks"].append("solver_log_only_zmax_mode_1")
             result["result_csv"] = str(self.run_dir / "reflection.csv")
@@ -421,11 +447,15 @@ class ResearchSession:
             xt, t = curves["1D Results\\S-Parameters\\S2,1"]
             if x != xt:
                 raise RuntimeError("Waveguide result grids are not aligned")
-            result["numerical_validity"] = validate_waveguide(x, r, t, self.job["parameters"])
+            result["numerical_validity"] = self._waveguide_check(x, r, t)
+            dissipative = bool(result.get("lumped_elements", {}).get("dissipative"))
             with (self.run_dir / "sparameters.csv").open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.writer(stream)
-                writer.writerow(["frequency_ghz", "s11_real", "s11_imag", "s21_real", "s21_imag"])
-                writer.writerows((f, a.real, a.imag, b.real, b.imag) for f, a, b in zip(x, r, t))
+                columns = ["frequency_ghz", "s11_real", "s11_imag", "s21_real", "s21_imag"]
+                writer.writerow(columns + (["estimated_absorbed_power"] if dissipative else []))
+                writer.writerows([f, a.real, a.imag, b.real, b.imag] +
+                                 ([1.0 - abs(a) ** 2 - abs(b) ** 2] if dissipative else [])
+                                 for f, a, b in zip(x, r, t))
             result["result_csv"] = str(self.run_dir / "sparameters.csv")
         result["status"] = "exported"
         _write(self.run_dir / "research_result.json", result)
@@ -446,6 +476,30 @@ class ResearchSession:
             required = ["1D Results\\S-Parameters\\S1,1", "1D Results\\S-Parameters\\S2,1"]
         for path in required:
             if not any(q["treepath"] == path and q["run_id"] == 0 for q in queries):
+                queries.append({"treepath": path, "run_id": 0})
+        monitored = {item["name"] for item in self.job.get("lumped_elements", []) if item["monitor"]}
+        monitor_paths, coverage, power_paths = [], {name: set() for name in monitored}, []
+        for path in tree:
+            leaf = path.rsplit("\\", 1)[-1]
+            for name in monitored:
+                if leaf == name or leaf.startswith(name + " ["):
+                    for category in ("Voltages", "Currents", "Impedances"):
+                        if path.startswith("1D Results\\Lumped Elements\\" + category + "\\"):
+                            monitor_paths.append(path)
+                            coverage[name].add(category)
+            if self.job.get("lumped_elements") and path.startswith("1D Results\\Power\\"):
+                if leaf == "Loss in Lumped Elements" or any(
+                        leaf == "Loss in element " + item["name"] for item in self.job["lumped_elements"]):
+                    power_paths.append(path)
+        missing = [name for name, categories in coverage.items() if not {"Voltages", "Currents"} <= categories]
+        if self.job.get("lumped_elements"):
+            _write(self.run_dir / "lumped_monitor_discovery.json", {
+                "requested": sorted(monitored), "observed_paths": monitor_paths,
+                "missing_voltage_or_current": missing, "power_loss_paths": power_paths})
+        if missing:
+            raise RuntimeError(f"Requested lumped voltage/current monitors are absent: {missing}")
+        for path in monitor_paths + power_paths:
+            if not any(query["treepath"] == path and query["run_id"] == 0 for query in queries):
                 queries.append({"treepath": path, "run_id": 0})
         if not queries:
             raise ValueError("Generic research jobs require explicit result_queries to determine export success")
@@ -474,7 +528,53 @@ class ResearchSession:
                              "csv": str(export), "sha256": _hash(export), "samples": len(x)})
             curves[path] = (x, y)
         _write(self.run_dir / "result_metadata.json", metadata)
+        if self.job.get("lumped_elements"):
+            _write(self.run_dir / "lumped_monitor_exports.json", {
+                "requested": sorted(monitored), "voltage_current_exported": bool(monitored) and not missing,
+                "all_requested_monitors_satisfied": not missing,
+                "curves": [item for item in metadata if item["treepath"] in monitor_paths + power_paths],
+                "scope": "Exact observed result-tree paths; use exported labels and CST normalization when interpreting voltage, current and power"})
         return curves
+
+    def _waveguide_check(self, frequency: list, reflection: list, transmission: list) -> dict:
+        if not self.job.get("lumped_elements"):
+            return validate_waveguide(frequency, reflection, transmission, self.job["parameters"])
+        # Loading changes matching and dispersion. The uniform TE10 analytic
+        # validator is only applicable to the original unloaded template.
+        if not frequency or len(frequency) != len(reflection) or len(frequency) != len(transmission):
+            raise RuntimeError("Loaded waveguide requires aligned nonempty S11/S21 data")
+        if any(not math.isfinite(float(value)) for value in frequency):
+            raise RuntimeError("Loaded waveguide frequency samples must be finite")
+        if any(b <= a for a, b in zip(frequency, frequency[1:])):
+            raise RuntimeError("Loaded waveguide frequency samples must increase strictly")
+        p = self.job["parameters"]
+        if abs(frequency[0] - p["fmin_ghz"]) > 1e-5 or abs(frequency[-1] - p["fmax_ghz"]) > 1e-5:
+            raise RuntimeError("Loaded waveguide frequency band does not match the job's GHz band")
+        if any(not math.isfinite(complex(value).real) or not math.isfinite(complex(value).imag)
+               for value in list(reflection) + list(transmission)):
+            raise RuntimeError("Loaded waveguide S-parameters must be finite")
+        loading = lumped_metadata(self.job["lumped_elements"], p)
+        power = [abs(a) ** 2 + abs(b) ** 2 for a, b in zip(reflection, transmission)]
+        checks = {"finite_aligned_sparameters": True,
+                  "passivity_with_5_percent_margin": all(0 <= value <= 1.05 for value in power)}
+        check = {"checks": checks, "sample_count": len(frequency),
+                 "dissipative_loading": loading["dissipative"],
+                 "min_outgoing_power": min(power), "max_outgoing_power": max(power),
+                 "analytic_te10_check": "not_applicable_to_loaded_model",
+                 "mesh_convergence": False, "physical_validation": "not_performed"}
+        if loading["dissipative"]:
+            estimates = [1.0 - value for value in power]
+            check.update(min_estimated_absorbed_power=min(estimates),
+                         max_estimated_absorbed_power=max(estimates),
+                         power_balance_verified=False,
+                         scope="Loaded passive two-port S-parameter screening; 1-|S11|^2-|S21|^2 is estimated unreturned power, not independently verified resistor loss or energy balance")
+        else:
+            error = max(abs(1.0 - value) for value in power)
+            checks["lossless_power_balance_within_5_percent"] = error <= 0.05
+            check.update(max_power_balance_error=error,
+                         scope="Reactive-loaded single-mode waveguide power screening; no uniform-guide phase, matching or mesh-convergence certificate")
+        check["passed"] = all(checks.values())
+        return check
 
     def _metasurface_result(self, curves: dict) -> dict:
         co_path = "1D Results\\S-Parameters\\SZmax(1),Zmax(1)"
@@ -490,10 +590,15 @@ class ResearchSession:
             raise RuntimeError("Floquet result frequency band or GHz units do not match the job")
         power = [abs(a) ** 2 + abs(b) ** 2 for a, b in zip(co, cross)]
         error = max(abs(value - 1) for value in power)
+        loading = (lumped_metadata(self.job["lumped_elements"], p)
+                   if self.job.get("lumped_elements") else {})
+        dissipative = bool(loading.get("dissipative"))
         with (self.run_dir / "reflection.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["frequency_ghz", "s11_real", "s11_imag", "cross_real", "cross_imag", "total_reflected_power"])
-            writer.writerows((f, a.real, a.imag, b.real, b.imag, q) for f, a, b, q in zip(x, co, cross, power))
+            columns = ["frequency_ghz", "s11_real", "s11_imag", "cross_real", "cross_imag", "total_reflected_power"]
+            writer.writerow(columns + (["estimated_absorbed_power"] if dissipative else []))
+            writer.writerows([f, a.real, a.imag, b.real, b.imag, q] + ([1.0 - q] if dissipative else [])
+                             for f, a, b, q in zip(x, co, cross, power))
         check = {"passed": error <= 0.05, "max_reflected_power_error": error,
                  "min_co_reflection_db": min(20 * math.log10(max(abs(v), 1e-300)) for v in co),
                  "max_cross_reflection_db": max(20 * math.log10(max(abs(v), 1e-300)) for v in cross),
@@ -501,5 +606,15 @@ class ResearchSession:
                  "scope": "Lossless grounded sub-diffraction unit cell power-balance check; no mesh or modal convergence claim",
                  "mesh_convergence": False, "modal_convergence": False,
                  "phase_reference_plane_z_mm": p["substrate_height_mm"] + p["metal_thickness_mm"]}
+        if loading:
+            check["dissipative_loading"] = dissipative
+        if dissipative:
+            check.pop("max_reflected_power_error")
+            check.update(passed=all(0 <= value <= 1.05 for value in power),
+                         passivity_check_passed=all(0 <= value <= 1.05 for value in power),
+                         min_estimated_absorbed_power=min(1.0 - value for value in power),
+                         max_estimated_absorbed_power=max(1.0 - value for value in power),
+                         power_balance_verified=False,
+                         scope="Resistively loaded grounded sub-diffraction unit cell passivity screening; 1-total reflected power estimates unreturned power without independently verifying dissipation or energy balance")
         _write(self.run_dir / "numerical_check.json", check)
         return check
